@@ -130,7 +130,7 @@ def answer_question(question):
         unit = target if by_revenue else "units"
         return f"Top product: {product}, with {value:.2f} {unit}."
 
-    if any(w in q for w in ("revenue", "sales", "turnover", "earnings", "income", "total amount")):
+    if any(w in q for w in ("revenue", "sales", "turnover", "earn", "earnings", "income", "total amount")):
         total = sum(money(o, target) for o in paid)
         return f"Total revenue: {total:.2f} {target} across {len(paid)} paid orders."
 
