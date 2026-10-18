@@ -1,17 +1,30 @@
 import json
 import re
-from collections import defaultdict
+import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI
+import pandas as pd
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 app = FastAPI()
 IST = ZoneInfo("Asia/Kolkata")
 
+# USD value of one unit of each currency, from your exam API.
 RATES = {"USD": 1.0, "EUR": 1.12, "INR": 0.01223}
-ORDERS = []
+
+MONTHS = {
+    "january": "01", "february": "02", "march": "03",
+    "april": "04", "may": "05", "june": "06",
+    "july": "07", "august": "08", "september": "09",
+    "october": "10", "november": "11", "december": "12",
+}
+REGIONS = ["North", "South", "East", "West", "Central"]
+PRODUCTS = [
+    "Air Fryer", "Rice Cooker", "Juicer", "Toaster",
+    "Mixer", "Kettle", "Blender", "Grinder",
+]
 
 
 def parse_time(value):
@@ -19,140 +32,212 @@ def parse_time(value):
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=IST)
-    return dt.astimezone(IST)
+    return dt
 
 
-# Keep only the latest version of each order.
-latest = {}
-with open("orders.ndjson", encoding="utf-8") as f:
-    for line in f:
-        if not line.strip():
-            continue
-        order = json.loads(line)
-        oid = order["id"]
-        if oid not in latest or parse_time(order["updated_at"]) > parse_time(latest[oid]["updated_at"]):
-            latest[oid] = order
+def load_orders():
+    latest = {}
 
-ORDERS = list(latest.values())
+    with open("orders.ndjson", encoding="utf-8") as file:
+        for line in file:
+            if not line.strip():
+                continue
+
+            order = json.loads(line)
+            oid = order["id"]
+            old = latest.get(oid)
+
+            if old is None or parse_time(order["updated_at"]) > parse_time(old["updated_at"]):
+                latest[oid] = order
+
+    rows = list(latest.values())
+    df = pd.DataFrame(rows)
+
+    df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+    df["updated_at"] = pd.to_datetime(df["updated_at"], utc=True)
+
+    # Business dates are based on Asia/Kolkata.
+    local_created = df["created_at"].dt.tz_convert("Asia/Kolkata")
+    df["created_month"] = local_created.dt.strftime("%Y-%m")
+    df["created_year"] = local_created.dt.year
+
+    # Convert all amounts to USD for consistent calculations.
+    df["amount_usd"] = (
+        df["amount"] * df["currency"].map(RATES)
+    )
+
+    if df["amount_usd"].isna().any():
+        raise ValueError("An order contains an unknown currency.")
+
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    df.drop(columns=["created_at", "updated_at"]).to_sql(
+        "orders", conn, index=False, if_exists="replace"
+    )
+    return conn, len(df)
+
+
+db, order_count = load_orders()
+print(f"Ledger ready: {order_count} unique orders")
 
 
 class Question(BaseModel):
     question: str
 
 
-def money(order, target):
-    source = order.get("currency", "USD").upper()
-    amount = float(order.get("amount", 0))
-    return amount * RATES.get(source, 1.0) / RATES[target]
-
-
-def answer_question(question):
+def parse_question(question):
     q = question.lower()
-    target = next((c for c in RATES if re.search(r"\b" + c.lower() + r"\b", q)), "USD")
+    conditions = []
+    params = []
 
-    # Filter by region, product, and customer when mentioned.
-    rows = ORDERS[:]
+    # Paid orders count as revenue; refund and void questions use their status.
+    if re.search(r"\b(refund|refunded|refunds)\b", q):
+        conditions.append("status = ?")
+        params.append("refunded")
+    elif re.search(r"\b(void|voided|cancel|cancelled|canceled)\b", q):
+        conditions.append("status = ?")
+        params.append("void")
+    else:
+        conditions.append("status = ?")
+        params.append("paid")
 
-    regions = sorted({o["region"] for o in ORDERS}, key=len, reverse=True)
-    for region in regions:
-        if re.search(r"\b" + re.escape(region.lower()) + r"\b", q):
-            rows = [o for o in rows if o["region"].lower() == region.lower()]
+    for region in REGIONS:
+        if re.search(rf"\b{region.lower()}\b", q):
+            conditions.append("region = ?")
+            params.append(region)
             break
 
-    products = sorted({o["product"] for o in ORDERS}, key=len, reverse=True)
-    for product in products:
-        if product.lower() in q:
-            rows = [o for o in rows if o["product"].lower() == product.lower()]
+    for product in PRODUCTS:
+        if re.search(rf"\b{re.escape(product.lower())}\b", q):
+            conditions.append("product = ?")
+            params.append(product)
             break
 
-    customers = sorted({o["customer"] for o in ORDERS}, key=len, reverse=True)
-    for customer in customers:
-        if customer.lower() in q:
-            rows = [o for o in rows if o["customer"].lower() == customer.lower()]
+    customer_match = re.search(r"\b(c\d{4})\b", q)
+    if customer_match:
+        conditions.append("customer = ?")
+        params.append(customer_match.group(1).upper())
+
+    year_match = re.search(r"\b(20\d{2})\b", q)
+    year = int(year_match.group(1)) if year_match else None
+
+    month = None
+    for name, number in MONTHS.items():
+        if re.search(rf"\b{name}\b", q):
+            month = number
             break
 
-    # Filter by a named month and optional year.
-    months = {
-        "january": 1, "february": 2, "march": 3, "april": 4,
-        "may": 5, "june": 6, "july": 7, "august": 8,
-        "september": 9, "october": 10, "november": 11, "december": 12,
-    }
-    for name, number in months.items():
-        if re.search(r"\b" + name + r"\b", q):
-            year_match = re.search(r"\b(20\d{2})\b", q)
-            year = int(year_match.group(1)) if year_match else None
+    if month:
+        # If a month is mentioned without a year, use 2026.
+        year = year if year is not None else 2026
+        conditions.append("created_month = ?")
+        params.append(f"{year}-{month}")
+    elif year is not None:
+        conditions.append("created_year = ?")
+        params.append(year)
 
-            def in_month(o):
-                dt = parse_time(o["created_at"])
-                return dt.month == number and (year is None or dt.year == year)
+    where = " AND ".join(conditions) if conditions else "1=1"
 
-            rows = [o for o in rows if in_month(o)]
-            break
+    # Output currency requested by the question; default to USD.
+    target_currency = "USD"
+    if re.search(r"\b(eur|euro|euros)\b", q):
+        target_currency = "EUR"
+    elif re.search(r"\b(inr|rupees?|₹)\b", q):
+        target_currency = "INR"
 
-    # Handle an explicit year when no month was named.
-    if not any(re.search(r"\b" + m + r"\b", q) for m in months):
-        year_match = re.search(r"\b(20\d{2})\b", q)
-        if year_match:
-            year = int(year_match.group(1))
-            rows = [o for o in rows if parse_time(o["created_at"]).year == year]
+    # Questions asking for the best-performing product/customer/region.
+    if any(x in q for x in [
+        "which product", "what product", "top product",
+        "top-selling product", "best-selling product",
+        "bestselling product", "product earned the most",
+        "most popular product",
+    ]):
+        metric = "SUM(qty)" if any(
+            x in q for x in ["qty", "quantity", "units", "most sold"]
+        ) else "SUM(amount_usd)"
+        sql = (
+            f"SELECT product FROM orders WHERE {where} "
+            f"GROUP BY product ORDER BY {metric} DESC, product ASC LIMIT 1"
+        )
+        return sql, params, "string", target_currency
 
-    # Recognize common business questions.
-    if any(w in q for w in ("refund", "refunded", "refunds")):
-        selected = [o for o in rows if o["status"].lower() == "refunded"]
-        total = sum(money(o, target) for o in selected)
-        return f"Total refunds: {total:.2f} {target} across {len(selected)} refunded orders."
+    if any(x in q for x in [
+        "which customer", "what customer", "top customer",
+        "customer spent the most",
+    ]):
+        sql = (
+            f"SELECT customer FROM orders WHERE {where} "
+            "GROUP BY customer ORDER BY SUM(amount_usd) DESC, customer ASC LIMIT 1"
+        )
+        return sql, params, "string", target_currency
 
-    paid = [o for o in rows if o["status"].lower() == "paid"]
+    if any(x in q for x in [
+        "which region", "what region", "top region",
+        "region earned the most",
+    ]):
+        sql = (
+            f"SELECT region FROM orders WHERE {where} "
+            "GROUP BY region ORDER BY SUM(amount_usd) DESC, region ASC LIMIT 1"
+        )
+        return sql, params, "string", target_currency
 
-    if any(w in q for w in ("how many customer", "number of customer", "unique customer", "customer count")):
-        return f"Unique customers: {len({o['customer'] for o in rows})}."
+    if any(x in q for x in [
+        "distinct customer", "different customer",
+        "unique customer", "how many customer",
+    ]):
+        sql = f"SELECT COUNT(DISTINCT customer) FROM orders WHERE {where}"
+        return sql, params, "int", target_currency
 
-    if any(w in q for w in ("how many order", "number of order", "order count", "count of order")):
-        return f"Orders: {len(rows)}."
+    if "average" in q:
+        sql = f"SELECT COALESCE(AVG(amount_usd), 0) FROM orders WHERE {where}"
+        return sql, params, "money", target_currency
 
-    if any(w in q for w in ("units sold", "quantity sold", "how many units", "total quantity")):
-        qty = sum(int(o.get("qty", 0)) for o in paid)
-        return f"Total units sold: {qty}."
+    if any(x in q for x in [
+        "how many orders", "how many order", "count the",
+        "number of orders", "number of order", "order count",
+    ]):
+        sql = f"SELECT COUNT(*) FROM orders WHERE {where}"
+        return sql, params, "int", target_currency
 
-    if any(w in q for w in ("average order value", "average sale", "average revenue")):
-        total = sum(money(o, target) for o in paid)
-        avg = total / len(paid) if paid else 0
-        return f"Average order value: {avg:.2f} {target}."
+    if any(x in q for x in [
+        "how many units", "total quantity", "total units",
+        "quantity sold", "units sold",
+    ]):
+        sql = f"SELECT COALESCE(SUM(qty), 0) FROM orders WHERE {where}"
+        return sql, params, "int", target_currency
 
-    if any(w in q for w in ("top product", "best-selling product", "bestselling product", "most popular product", "most sold product")):
-        totals = defaultdict(float)
-        by_revenue = "revenue" in q or "sales" in q
-        for o in paid:
-            totals[o["product"]] += money(o, target) if by_revenue else int(o.get("qty", 0))
-        if not totals:
-            return "No matching paid orders were found."
-        product, value = max(totals.items(), key=lambda x: x[1])
-        unit = target if by_revenue else "units"
-        return f"Top product: {product}, with {value:.2f} {unit}."
-
-    if any(w in q for w in ("revenue", "sales", "turnover", "earn", "earnings", "income", "total amount")):
-        total = sum(money(o, target) for o in paid)
-        return f"Total revenue: {total:.2f} {target} across {len(paid)} paid orders."
-
-    # Useful default for a general ledger question.
-    total = sum(money(o, target) for o in paid)
-    return (
-        f"Ledger summary: revenue {total:.2f} {target}; "
-        f"{len(paid)} paid orders; "
-        f"{sum(1 for o in rows if o['status'].lower() == 'refunded')} refunded orders; "
-        f"{len({o['customer'] for o in rows})} unique customers."
-    )
+    # Default question: total revenue, earnings, or refund amount.
+    sql = f"SELECT COALESCE(SUM(amount_usd), 0) FROM orders WHERE {where}"
+    return sql, params, "money", target_currency
 
 
 @app.get("/")
 def health():
-    return {"status": "ok", "orders_loaded": len(ORDERS)}
+    return {"status": "ok", "orders_loaded": order_count}
 
 
 @app.post("/")
 @app.post("/answer")
-def answer(data: Question):
-    try:
-        return {"answer": answer_question(data.question)}
-    except Exception:
-        return {"answer": "Unable to calculate an answer for that question."}
+def answer_question(data: Question):
+    if not data.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+    sql, params, answer_type, target_currency = parse_question(data.question)
+    cursor = db.cursor()
+    cursor.execute(sql, params)
+    row = cursor.fetchone()
+    value = row[0] if row and row[0] is not None else 0
+
+    if answer_type == "string":
+        result = str(value) if value else "No matching result"
+    elif answer_type == "int":
+        result = int(value)
+    else:
+        # Convert from USD into the requested currency.
+        result = round(float(value) / RATES[target_currency], 2)
+
+    print(f"Question: {data.question}")
+    print(f"SQL: {sql}")
+    print(f"Answer: {result}")
+
+    # Return the raw number/string, not a sentence.
+    return {"answer": result}
